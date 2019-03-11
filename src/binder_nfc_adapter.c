@@ -543,6 +543,47 @@ binder_nfc_adapter_open_reply(
 }
 
 static
+void
+binder_nfc_adapter_power_cycle_reply(
+    GBinderClient* client,
+    GBinderRemoteReply* reply,
+    int status,
+    void* user_data)
+{
+    int result = -1;
+    BinderNfcAdapter* self = BINDER_NFC_ADAPTER(user_data);
+    const gboolean success = (status == GBINDER_STATUS_OK &&
+        gbinder_remote_reply_read_int32(reply, &result) &&
+        result == 0);
+
+    GASSERT(self->pending_tx);
+    self->pending_tx = 0;
+    if (self->need_power) {
+        if (success) {
+            if (self->open_cplt) {
+                GDEBUG("Power cycle done, opening the device");
+                self->pending_tx = binder_nfc_client_open(self,
+                    binder_nfc_adapter_open_reply);
+            } else {
+                binder_nfc_adapter_open_done(self);
+            }
+        } else {
+            GWARN("Power cycle error %d, trying to open", result);
+            self->open_cplt = binder_nfc_adapter_open_cplt;
+            self->pending_tx = binder_nfc_client_open(self,
+                binder_nfc_adapter_open_reply);
+        }
+    } else {
+        GDEBUG("Opps, we don't need the power anymore");
+        if (self->open_cplt) {
+            self->open_cplt = binder_nfc_adapter_open_cancel;
+        } else {
+            binder_nfc_adapter_close(self);
+        }
+    }
+}
+
+static
 gboolean
 binder_nfc_adapter_open(
     BinderNfcAdapter* self)
@@ -557,8 +598,8 @@ binder_nfc_adapter_open(
     }
     self->core_initialized = FALSE;
     self->open_cplt = binder_nfc_adapter_open_cplt;
-    self->pending_tx = binder_nfc_client_open(self,
-        binder_nfc_adapter_open_reply);
+    self->pending_tx = binder_nfc_client_power_cycle(self,
+        binder_nfc_adapter_power_cycle_reply);
     return (self->pending_tx != 0);
 }
 
