@@ -30,6 +30,7 @@
  * THE POSSIBILITY OF SUCH DAMAGE.
  */
 
+#include "binder_nfc_plugin.h"
 #include "binder_nfc.h"
 #include "plugin.h"
 
@@ -45,25 +46,164 @@
 
 GLOG_MODULE_DEFINE("binder");
 
+#define BINDER_NFC_EXPORT __attribute__ ((visibility("default")))
+
 typedef struct binder_nfc_plugin_adapter_entry {
+    char* instance;
     gulong death_id;
+    gulong powering_off;
     NfcAdapter* adapter;
 } BinderNfcPluginEntry;
 
 typedef NfcPluginClass BinderNfcPluginClass;
-typedef struct binder_nfc_plugin {
+struct binder_nfc_plugin {
     NfcPlugin parent;
     GBinderServiceManager* sm;
     NfcManager* manager;
     GHashTable* adapters;
     gulong name_watch_id;
     gulong list_call_id;
-} BinderNfcPlugin;
+    gint blocked;
+    gboolean actually_blocked;
+};
 
 G_DEFINE_TYPE(BinderNfcPlugin, binder_nfc_plugin, NFC_TYPE_PLUGIN)
 #define BINDER_TYPE_PLUGIN (binder_nfc_plugin_get_type())
 #define BINDER_NFC_PLUGIN(obj) (G_TYPE_CHECK_INSTANCE_CAST((obj), \
         BINDER_TYPE_PLUGIN, BinderNfcPlugin))
+#define BINDER_IS_NFC_PLUGIN(obj) G_TYPE_CHECK_INSTANCE_TYPE(obj, \
+        BINDER_TYPE_PLUGIN)
+
+enum nfc_manager_signal {
+    SIGNAL_BLOCKED_CHANGED,
+    SIGNAL_COUNT
+};
+
+#define SIGNAL_BLOCKED_CHANGED_NAME "binder-nfc-plugin-blocked-changed"
+
+static guint binder_nfc_plugin_signals[SIGNAL_COUNT] = { 0 };
+
+struct binder_nfc_plugin_block {
+    BinderNfcPlugin* binder;
+};
+
+static
+void
+binder_nfc_plugin_update_blocked(
+    BinderNfcPlugin* self);
+
+static
+void
+binder_nfc_plugin_update_entry(
+    BinderNfcPlugin* self,
+    BinderNfcPluginEntry* entry);
+
+BINDER_NFC_EXPORT
+BinderNfcPlugin*
+binder_nfc_plugin_cast(
+    NfcPlugin* plugin)
+{
+    return (G_LIKELY(plugin) && BINDER_IS_NFC_PLUGIN(plugin)) ?
+        BINDER_NFC_PLUGIN(plugin) : NULL;
+}
+
+BINDER_NFC_EXPORT
+BinderNfcPlugin*
+binder_nfc_plugin_ref(
+    BinderNfcPlugin* self)
+{
+    if (G_LIKELY(self)) {
+        nfc_plugin_ref(NFC_PLUGIN(self));
+    }
+    return self;
+}
+
+BINDER_NFC_EXPORT
+void
+binder_nfc_plugin_unref(
+    BinderNfcPlugin* self)
+{
+    if (G_LIKELY(self)) {
+        nfc_plugin_unref(NFC_PLUGIN(self));
+    }
+}
+
+BINDER_NFC_EXPORT
+BinderNfcPluginBlock*
+binder_nfc_plugin_block_new(
+    BinderNfcPlugin* self)
+{
+    if (G_LIKELY(self)) {
+        BinderNfcPluginBlock* block = g_slice_new0(BinderNfcPluginBlock);
+
+        block->binder = binder_nfc_plugin_ref(self);
+        self->blocked++;
+        binder_nfc_plugin_update_blocked(self);
+        return block;
+    }
+    return NULL;
+}
+
+BINDER_NFC_EXPORT
+void
+binder_nfc_plugin_block_free(
+    BinderNfcPluginBlock* block)
+{
+    if (G_LIKELY(block)) {
+        BinderNfcPlugin* self = block->binder;
+
+        GASSERT(self->blocked > 0);
+        self->blocked--;
+        binder_nfc_plugin_update_blocked(self);
+        binder_nfc_plugin_unref(self);
+        g_slice_free1(sizeof(*block), block);
+    }
+}
+
+BINDER_NFC_EXPORT
+gboolean
+binder_nfc_plugin_is_blocked(
+    BinderNfcPlugin* binder)
+{
+    return G_LIKELY(binder) && binder->actually_blocked;
+}
+
+BINDER_NFC_EXPORT
+gulong
+binder_nfc_plugin_add_blocked_handler(
+    BinderNfcPlugin* binder,
+    BinderNfcPluginFunc callback,
+    void* user_data)
+{
+    return (G_LIKELY(binder) && G_LIKELY(callback)) ? g_signal_connect(binder,
+        SIGNAL_BLOCKED_CHANGED_NAME, G_CALLBACK(callback), user_data) : 0;
+}
+
+BINDER_NFC_EXPORT
+void
+binder_nfc_plugin_remove_handler(
+    BinderNfcPlugin* binder,
+    gulong id)
+{
+    if (G_LIKELY(binder) && G_LIKELY(id)) {
+        g_signal_handler_disconnect(binder, id);
+    }
+}
+
+static
+NfcAdapter*
+binder_nfc_plugin_detach_adapter(
+    BinderNfcPluginEntry* entry)
+{
+    NfcAdapter* adapter = entry->adapter;
+
+    nfc_adapter_remove_handler(adapter, entry->powering_off);
+    nfc_adapter_remove_handler(adapter, entry->death_id);
+    entry->powering_off = 0;
+    entry->death_id = 0;
+    entry->adapter = NULL;
+    return adapter; /* Caller has to unref it */
+}
 
 static
 void
@@ -80,10 +220,95 @@ binder_nfc_plugin_adapter_death_proc(
         BinderNfcPluginEntry* entry = value;
 
         if (entry->adapter == value) {
+            NfcAdapter* adapter = binder_nfc_plugin_detach_adapter(entry);
+
             GWARN("NFC adapter \"%s\" has disappeared", (char*)key);
-            nfc_manager_remove_adapter(self->manager, adapter->name);
             g_hash_table_iter_remove(&it);
+            nfc_manager_remove_adapter(self->manager, adapter->name);
+            nfc_adapter_unref(adapter);
             break;
+        }
+    }
+}
+
+static
+void
+binder_nfc_plugin_update_blocked(
+    BinderNfcPlugin* self)
+{
+    guint adapters = 0, powering_off = 0;
+    gboolean actually_blocked;
+    gpointer value;
+    GHashTableIter it;
+
+    g_hash_table_iter_init(&it, self->adapters);
+    while (g_hash_table_iter_next(&it, NULL, &value)) {
+        BinderNfcPluginEntry* entry = value;
+
+        binder_nfc_plugin_update_entry(self, entry);
+        if (entry->adapter) {
+            adapters++;
+            if (entry->powering_off) {
+                powering_off++;
+            }
+        }
+    }
+
+    actually_blocked = (self->blocked && !powering_off);
+    if (self->actually_blocked != actually_blocked) {
+        self->actually_blocked = actually_blocked;
+        g_signal_emit(self, binder_nfc_plugin_signals
+            [SIGNAL_BLOCKED_CHANGED], 0);
+    }
+}
+
+static
+void
+binder_nfc_plugin_powered_off(
+    NfcAdapter* adapter,
+    void* plugin)
+{
+    binder_nfc_plugin_update_blocked(BINDER_NFC_PLUGIN(plugin));
+}
+
+static
+void
+binder_nfc_plugin_update_entry(
+    BinderNfcPlugin* self,
+    BinderNfcPluginEntry* entry)
+{
+    if (entry->adapter && !entry->adapter->powered && entry->powering_off) {
+        /* Done with powering off */
+        nfc_adapter_unref(binder_nfc_plugin_detach_adapter(entry));
+    }
+
+    if (self->blocked) {
+        if (entry->adapter) {
+            NfcAdapter* adapter = nfc_adapter_ref(entry->adapter);
+
+            nfc_manager_remove_adapter(self->manager, adapter->name);
+            if (adapter->powered) {
+                /* Close it (power off) before actually freeing it */
+                if (!entry->powering_off) {
+                    entry->powering_off =
+                        nfc_adapter_add_powered_changed_handler(adapter,
+                            binder_nfc_plugin_powered_off, self);
+                    nfc_adapter_request_power(adapter, FALSE);
+                }
+            } else {
+                /* Can drop it */
+                nfc_adapter_unref(binder_nfc_plugin_detach_adapter(entry));
+            }
+            nfc_adapter_unref(adapter);
+        }
+    } else if (!entry->adapter) {
+        entry->adapter = binder_nfc_adapter_new(self->sm, entry->instance);
+
+        if (entry->adapter) {
+            GINFO("NFC adapter \"%s\"", entry->instance);
+            entry->death_id = binder_nfc_adapter_add_death_handler
+                (entry->adapter, binder_nfc_plugin_adapter_death_proc, self);
+            nfc_manager_add_adapter(self->manager, entry->adapter);
         }
     }
 }
@@ -95,9 +320,9 @@ binder_nfc_plugin_adapter_entry_free(
 {
     BinderNfcPluginEntry* entry = data;
 
-    nfc_adapter_remove_handler(entry->adapter, entry->death_id);
-    nfc_adapter_unref(entry->adapter);
-    g_free(entry);
+    nfc_adapter_unref(binder_nfc_plugin_detach_adapter(entry));
+    g_free(entry->instance);
+    g_slice_free1(sizeof(*entry), entry);
 }
 
 static
@@ -106,20 +331,15 @@ binder_nfc_plugin_add_adapter(
     BinderNfcPlugin* self,
     const char* instance)
 {
-    if (instance[0] && !g_hash_table_contains(self->adapters, instance)) {
-        NfcAdapter* adapter = binder_nfc_adapter_new(self->sm, instance);
+    BinderNfcPluginEntry* entry = g_hash_table_lookup(self->adapters, instance);
 
-        if (adapter) {
-            BinderNfcPluginEntry* entry = g_new0(BinderNfcPluginEntry, 1);
-
-            GINFO("NFC adapter \"%s\"", instance);
-            entry->adapter = adapter;
-            entry->death_id = binder_nfc_adapter_add_death_handler(adapter,
-                binder_nfc_plugin_adapter_death_proc, self);
-            g_hash_table_insert(self->adapters, g_strdup(instance), entry);
-            nfc_manager_add_adapter(self->manager, adapter);
-        }
+    if (!entry) {
+        GINFO("NFC adapter \"%s\"", instance);
+        entry = g_slice_new0(BinderNfcPluginEntry);
+        entry->instance = g_strdup(instance);
+        g_hash_table_insert(self->adapters, entry->instance, entry);
     }
+    binder_nfc_plugin_update_entry(self, entry);
 }
 
 static
@@ -137,7 +357,7 @@ binder_nfc_plugin_service_list_proc(
         if (g_str_has_prefix(*ptr, BINDER_NFC)) {
             const char* sep = strchr(*ptr, '/');
 
-            if (sep) {
+            if (sep && sep[1]) {
                 binder_nfc_plugin_add_adapter(self, sep + 1);
             }
         }
@@ -197,13 +417,30 @@ binder_nfc_plugin_stop(
     if (self->manager) {
         GHashTableIter it;
         gpointer value;
+        GPtrArray* adapters = NULL;
 
         g_hash_table_iter_init(&it, self->adapters);
         while (g_hash_table_iter_next(&it, NULL, &value)) {
-            BinderNfcPluginEntry* entry = value;
+            NfcAdapter* adapter = binder_nfc_plugin_detach_adapter(value);
 
-            nfc_manager_remove_adapter(self->manager, entry->adapter->name);
-            g_hash_table_iter_remove(&it);
+            if (adapter) {
+                if (!adapters) {
+                    adapters = g_ptr_array_new_with_free_func((GDestroyNotify)
+                        nfc_adapter_unref);
+                }
+                g_ptr_array_add(adapters, adapter);
+            }
+        }
+        g_hash_table_remove_all(self->adapters);
+        if (adapters) {
+            guint i;
+
+            for (i = 0; i < adapters->len; i++) {
+                NfcAdapter* adapter = adapters->pdata[i];
+
+                nfc_manager_remove_adapter(self->manager, adapter->name);
+            }
+            g_ptr_array_free(adapters, TRUE);
         }
         nfc_manager_unref(self->manager);
         if (self->list_call_id) {
@@ -223,8 +460,8 @@ void
 binder_nfc_plugin_init(
     BinderNfcPlugin* self)
 {
-    self->adapters = g_hash_table_new_full(g_str_hash, g_str_equal,
-        g_free, binder_nfc_plugin_adapter_entry_free);
+    self->adapters = g_hash_table_new_full(g_str_hash, g_str_equal, NULL,
+        binder_nfc_plugin_adapter_entry_free);
 }
 
 static
@@ -249,6 +486,9 @@ binder_nfc_plugin_class_init(
     G_OBJECT_CLASS(klass)->finalize = binder_nfc_plugin_finalize;
     klass->start = binder_nfc_plugin_start;
     klass->stop = binder_nfc_plugin_stop;
+    binder_nfc_plugin_signals[SIGNAL_BLOCKED_CHANGED] =
+        g_signal_new(SIGNAL_BLOCKED_CHANGED_NAME, G_OBJECT_CLASS_TYPE(klass),
+            G_SIGNAL_RUN_FIRST, 0, NULL, NULL, NULL, G_TYPE_NONE, 0);
 }
 
 static
@@ -267,8 +507,10 @@ static GLogModule* const binder_nfc_plugin_logs[] = {
     NULL
 };
 
-NFC_PLUGIN_DEFINE2(binder, "binder integration", binder_nfc_plugin_create,
-    binder_nfc_plugin_logs, 0)
+const NfcPluginDesc NFC_PLUGIN_DESC(binder) NFC_PLUGIN_DESC_ATTR = {
+    BINDER_NFC_PLUGIN_NAME, "binder integration", NFC_CORE_VERSION,
+    binder_nfc_plugin_create, binder_nfc_plugin_logs, 0
+};
 
 /*
  * Local Variables:
