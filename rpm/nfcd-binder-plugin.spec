@@ -20,15 +20,23 @@ Requires: nfcd >= %{nfcd_version}
 %description
 Binder-based NFC plugin for Android 8+.
 
+%package devel
+Summary: Development files for %{name}
+Requires: pkgconfig(nfcd-plugin) >= %{nfcd_version}
+
+%description devel
+This package contains development files for %{name}.
+
 %prep
 %setup -q
 
 %build
-make %{_smp_mflags} KEEP_SYMBOLS=1 release
+make %{_smp_mflags} KEEP_SYMBOLS=1 release pkgconfig
 
 %install
 rm -rf %{buildroot}
-make install DESTDIR=%{buildroot}
+make install install-dev DESTDIR=%{buildroot}
+strip %{buildroot}/%{_libdir}/*.so
 
 %post
 systemctl reload-or-try-restart nfcd.service ||:
@@ -40,3 +48,9 @@ systemctl reload-or-try-restart nfcd.service ||:
 %defattr(-,root,root,-)
 %dir %{_libdir}/nfcd/plugins
 %{_libdir}/nfcd/plugins/*.so
+
+%files devel
+%defattr(-,root,root,-)
+%{_libdir}/pkgconfig/*.pc
+%{_libdir}/*.so
+%{_includedir}/nfcbinder/*.h

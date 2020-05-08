@@ -1,6 +1,6 @@
 # -*- Mode: makefile-gmake -*-
 
-.PHONY: clean all debug release install
+.PHONY: clean all debug release pkgconfig install install-dev
 
 #
 # Required packages
@@ -19,10 +19,21 @@ all: debug release
 # Library name
 #
 
-NAME = binder
+NAME = nfcbinder
 LIB_NAME = $(NAME)
 LIB_SONAME = $(LIB_NAME).so
 LIB = $(LIB_SONAME)
+
+#
+# Library version
+#
+
+VERSION_MAJOR = 1
+VERSION_MINOR = 1
+VERSION_RELEASE = 0
+
+# Version for pkg-config
+PCVERSION = $(VERSION_MAJOR).$(VERSION_MINOR).$(VERSION_RELEASE)
 
 #
 # Sources
@@ -37,6 +48,7 @@ SRC = \
 #
 
 SRC_DIR = src
+INCLUDE_DIR = include
 BUILD_DIR = build
 DEBUG_BUILD_DIR = $(BUILD_DIR)/debug
 RELEASE_BUILD_DIR = $(BUILD_DIR)/release
@@ -50,9 +62,10 @@ LD = $(CC)
 WARNINGS = -Wall
 BASE_FLAGS = -fPIC -fvisibility=hidden
 DEFINES = -DNFC_PLUGIN_EXTERNAL
-FULL_CFLAGS = $(BASE_FLAGS) $(CFLAGS) $(DEFINES) $(WARNINGS) -MMD -MP \
-  $(shell pkg-config --cflags $(PKGS))
-FULL_LDFLAGS = $(BASE_FLAGS) $(LDFLAGS) -shared
+INCLUDES = -I$(INCLUDE_DIR)
+FULL_CFLAGS = $(BASE_FLAGS) $(CFLAGS) $(DEFINES) $(INCLUDES) $(WARNINGS) \
+  -MMD -MP $(shell pkg-config --cflags $(PKGS))
+FULL_LDFLAGS = $(BASE_FLAGS) $(LDFLAGS) -shared -Wl,-soname -Wl,$(LIB_SONAME)
 DEBUG_FLAGS = -g
 RELEASE_FLAGS =
 
@@ -77,6 +90,7 @@ RELEASE_LIBS = $(LIBS)
 # Files
 #
 
+PKGCONFIG = $(BUILD_DIR)/$(LIB_NAME).pc
 DEBUG_OBJS = $(SRC:%.c=$(DEBUG_BUILD_DIR)/%.o)
 RELEASE_OBJS = $(SRC:%.c=$(RELEASE_BUILD_DIR)/%.o)
 
@@ -110,9 +124,14 @@ debug: $(DEBUG_LIB)
 
 release: $(RELEASE_LIB)
 
+pkgconfig: $(PKGCONFIG)
+
 clean:
 	rm -f *~ rpm/*~ $(SRC_DIR)/*~
 	rm -fr $(BUILD_DIR)
+
+$(BUILD_DIR):
+	mkdir -p $@
 
 $(DEBUG_BUILD_DIR):
 	mkdir -p $@
@@ -132,18 +151,38 @@ $(DEBUG_LIB): $(DEBUG_OBJS) $(DEBUG_DEPS)
 $(RELEASE_LIB): $(RELEASE_OBJS) $(RELEASE_DEPS)
 	$(LD) $(RELEASE_OBJS) $(RELEASE_LDFLAGS) $(RELEASE_LIBS) -o $@
 
+$(PKGCONFIG): $(LIB_NAME).pc.in
+	sed -e 's/\[version\]/'$(PCVERSION)/g $< > $@
+
 #
 # Install
 #
 
-INSTALL_PERM  = 755
 INSTALL = install
 INSTALL_DIRS = $(INSTALL) -d
-INSTALL_FILES = $(INSTALL) -m $(INSTALL_PERM)
-INSTALL_LIB_DIR = $(DESTDIR)/usr/lib/nfcd/plugins
+INSTALL_FILES = $(INSTALL) -m 644
 
-install: $(INSTALL_LIB_DIR)
+INSTALL_LIB_DIR = $(DESTDIR)/usr/lib/
+INSTALL_PLUGIN_DIR = $(DESTDIR)/usr/lib/nfcd/plugins
+INSTALL_INCLUDE_DIR = $(DESTDIR)/usr/include/$(NAME)
+INSTALL_PKGCONFIG_DIR = $(DESTDIR)/usr/lib/pkgconfig
+
+install: $(INSTALL_PLUGIN_DIR)
+	$(INSTALL_FILES) $(RELEASE_LIB) $<
+
+install-dev: $(INSTALL_LIB_DIR) $(INSTALL_INCLUDE_DIR) $(INSTALL_PKGCONFIG_DIR)
 	$(INSTALL_FILES) $(RELEASE_LIB) $(INSTALL_LIB_DIR)
+	$(INSTALL_FILES) $(INCLUDE_DIR)/*.h $(INSTALL_INCLUDE_DIR)
+	$(INSTALL_FILES) $(PKGCONFIG) $(INSTALL_PKGCONFIG_DIR)
 
 $(INSTALL_LIB_DIR):
+	$(INSTALL_DIRS) $@
+
+$(INSTALL_PLUGIN_DIR):
+	$(INSTALL_DIRS) $@
+
+$(INSTALL_INCLUDE_DIR):
+	$(INSTALL_DIRS) $@
+
+$(INSTALL_PKGCONFIG_DIR):
 	$(INSTALL_DIRS) $@
