@@ -1,4 +1,5 @@
 Name: nfcd-binder-plugin
+
 Version: 1.1.8
 Release: 0
 Summary: Binder-based NFC plugin
@@ -9,10 +10,16 @@ Source: %{name}-%{version}.tar.bz2
 %define libgbinder_version 1.0.30
 %define nfcd_version 1.0.20
 
+BuildRequires: pkgconfig
 BuildRequires: pkgconfig(libncicore)
 BuildRequires: pkgconfig(libnciplugin)
 BuildRequires: pkgconfig(libgbinder) >= %{libgbinder_version}
 BuildRequires: pkgconfig(nfcd-plugin) >= %{nfcd_version}
+
+# license macro requires rpm >= 4.11
+BuildRequires: pkgconfig(rpm)
+%define license_support %(pkg-config --exists 'rpm >= 4.11'; echo $?)
+
 Requires: libgbinder >= %{libgbinder_version}
 Requires: nfcd >= %{nfcd_version}
 
@@ -44,3 +51,6 @@ systemctl reload-or-try-restart nfcd.service ||:
 %defattr(-,root,root,-)
 %dir %{plugin_dir}
 %{plugin_dir}/*.so
+%if %{license_support} == 0
+%license LICENSE
+%endif
