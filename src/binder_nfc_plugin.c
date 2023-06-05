@@ -1,6 +1,6 @@
 /*
+ * Copyright (C) 2018-2023 Slava Monich <slava@monich.com>
  * Copyright (C) 2018-2020 Jolla Ltd.
- * Copyright (C) 2018-2020 Slava Monich <slava.monich@jolla.com>
  *
  * You may use this file under the terms of BSD license as follows:
  *
@@ -172,7 +172,7 @@ binder_nfc_plugin_start(
     BinderNfcPlugin* self = BINDER_NFC_PLUGIN(plugin);
     GASSERT(!self->sm);
 
-    self->sm = gbinder_hwservicemanager_new(NULL);
+    self->sm = gbinder_servicemanager_new(GBINDER_DEFAULT_HWBINDER);
     if (self->sm) {
         GVERBOSE("Starting");
         self->manager = nfc_manager_ref(manager);
