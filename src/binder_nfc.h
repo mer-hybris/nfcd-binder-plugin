@@ -61,8 +61,12 @@ GType binder_nfc_target_get_type(void);
 #define BINDER_IFACE(x)     "android.hardware.nfc@1.0::" x
 #define BINDER_NFC          BINDER_IFACE("INfc")
 #define BINDER_NFC_CALLBACK BINDER_IFACE("INfcClientCallback")
+#define BINDER_NFC_NAME     BINDER_NFC "/default"
 
-#define DEFAULT_INSTANCE    "default"
+#define BINDER_IFACE_AIDL(x)     "android.hardware.nfc." x
+#define BINDER_NFC_AIDL          BINDER_IFACE_AIDL("INfc")
+#define BINDER_NFC_AIDL_CALLBACK BINDER_IFACE_AIDL("INfcClientCallback")
+#define BINDER_NFC_NAME_AIDL     BINDER_NFC_AIDL "/default"
 
 NfcAdapter*
 binder_nfc_adapter_new(

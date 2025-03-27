@@ -54,8 +54,11 @@ typedef NfcPluginClass BinderNfcPluginClass;
 typedef struct binder_nfc_plugin {
     NfcPlugin parent;
     GBinderServiceManager* sm;
+    GBinderServiceManager* sm_aidl;
     NfcManager* manager;
     GHashTable* adapters;
+    gulong aidl_name_watch_id;
+    gulong aidl_list_call_id;
     gulong name_watch_id;
     gulong list_call_id;
 } BinderNfcPlugin;
@@ -104,10 +107,11 @@ static
 void
 binder_nfc_plugin_add_adapter(
     BinderNfcPlugin* self,
-    const char* instance)
+    const char* instance,
+    gboolean is_aidl)
 {
     if (instance[0] && !g_hash_table_contains(self->adapters, instance)) {
-        NfcAdapter* adapter = binder_nfc_adapter_new(self->sm, instance);
+        NfcAdapter* adapter = binder_nfc_adapter_new(is_aidl ? self->sm_aidl : self->sm, instance);
 
         if (adapter) {
             BinderNfcPluginEntry* entry = g_new0(BinderNfcPluginEntry, 1);
@@ -131,16 +135,37 @@ binder_nfc_plugin_service_list_proc(
 {
     BinderNfcPlugin* self = BINDER_NFC_PLUGIN(plugin);
 
-    self->list_call_id = 0;
+    if (g_str_equal(gbinder_servicemanager_device(sm), GBINDER_DEFAULT_BINDER)) {
+        self->aidl_list_call_id = 0;
+    } else {
+        self->list_call_id = 0;
+    }
     if (services) {
         char** ptr;
 
         for (ptr = services; *ptr; ptr++) {
+            if (g_str_has_prefix(*ptr, BINDER_NFC_AIDL)) {
+                const char* sep = strchr(*ptr, '/');
+
+                if (sep) {
+                    binder_nfc_plugin_add_adapter(self, sep + 1, TRUE);
+                    if (self->name_watch_id) {
+                        gbinder_servicemanager_remove_handler(self->sm,
+                            self->name_watch_id);
+                        self->name_watch_id = 0;
+                    }
+                }
+            }
             if (g_str_has_prefix(*ptr, BINDER_NFC)) {
                 const char* sep = strchr(*ptr, '/');
 
                 if (sep) {
-                    binder_nfc_plugin_add_adapter(self, sep + 1);
+                    binder_nfc_plugin_add_adapter(self, sep + 1, FALSE);
+                    if (self->aidl_name_watch_id) {
+                        gbinder_servicemanager_remove_handler(self->sm_aidl,
+                            self->aidl_name_watch_id);
+                        self->aidl_name_watch_id = 0;
+                    }
                 }
             }
         }
@@ -164,6 +189,21 @@ binder_nfc_plugin_service_registration_proc(
 }
 
 static
+void
+binder_nfc_plugin_service_registration_proc_aidl(
+    GBinderServiceManager* sm,
+    const char* name,
+    void* plugin)
+{
+    BinderNfcPlugin* self = BINDER_NFC_PLUGIN(plugin);
+
+    if (!self->aidl_list_call_id) {
+        self->aidl_list_call_id = gbinder_servicemanager_list(self->sm_aidl,
+            binder_nfc_plugin_service_list_proc, self);
+    }
+}
+
+static
 gboolean
 binder_nfc_plugin_start(
     NfcPlugin* plugin,
@@ -171,22 +211,39 @@ binder_nfc_plugin_start(
 {
     BinderNfcPlugin* self = BINDER_NFC_PLUGIN(plugin);
     GASSERT(!self->sm);
+    GASSERT(!self->sm_aidl);
+
+    self->sm_aidl = gbinder_servicemanager_new(GBINDER_DEFAULT_BINDER);
+    if (self->sm_aidl) {
+        GVERBOSE("Starting AIDL");
+        self->manager = nfc_manager_ref(manager);
+        self->aidl_name_watch_id =
+            gbinder_servicemanager_add_registration_handler(self->sm_aidl,
+                BINDER_NFC_NAME_AIDL, binder_nfc_plugin_service_registration_proc_aidl, self);
+        self->aidl_list_call_id =
+            gbinder_servicemanager_list(self->sm_aidl,
+                binder_nfc_plugin_service_list_proc, self);
+    }
 
     self->sm = gbinder_servicemanager_new(GBINDER_DEFAULT_HWBINDER);
     if (self->sm) {
-        GVERBOSE("Starting");
-        self->manager = nfc_manager_ref(manager);
+        GVERBOSE("Starting HIDL");
+        if (!self->manager) {
+            self->manager = nfc_manager_ref(manager);
+        }
         self->name_watch_id =
             gbinder_servicemanager_add_registration_handler(self->sm,
-                BINDER_NFC, binder_nfc_plugin_service_registration_proc, self);
+                BINDER_NFC_NAME, binder_nfc_plugin_service_registration_proc, self);
         self->list_call_id =
             gbinder_servicemanager_list(self->sm,
                 binder_nfc_plugin_service_list_proc, self);
-        return TRUE;
-    } else {
-        GERR("Failed to connect to hwservicemanager");
+    }
+
+    if (!self->sm && !self->sm_aidl) {
+        GERR("Failed to connect to any servicemanager");
         return FALSE;
     }
+    return TRUE;
 }
 
 static
@@ -209,6 +266,15 @@ binder_nfc_plugin_stop(
             g_hash_table_iter_remove(&it);
         }
         nfc_manager_unref(self->manager);
+        if (self->aidl_list_call_id) {
+            gbinder_servicemanager_cancel(self->sm_aidl, self->aidl_list_call_id);
+            self->aidl_list_call_id = 0;
+        }
+        if (self->aidl_name_watch_id) {
+            gbinder_servicemanager_remove_handler(self->sm_aidl,
+                self->aidl_name_watch_id);
+            self->aidl_name_watch_id = 0;
+        }
         if (self->list_call_id) {
             gbinder_servicemanager_cancel(self->sm, self->list_call_id);
             self->list_call_id = 0;
@@ -239,8 +305,11 @@ binder_nfc_plugin_finalize(
 
     g_hash_table_destroy(self->adapters);
     gbinder_servicemanager_remove_handler(self->sm, self->name_watch_id);
+    gbinder_servicemanager_remove_handler(self->sm_aidl, self->aidl_name_watch_id);
     gbinder_servicemanager_cancel(self->sm, self->list_call_id);
+    gbinder_servicemanager_cancel(self->sm_aidl, self->aidl_list_call_id);
     gbinder_servicemanager_unref(self->sm);
+    gbinder_servicemanager_unref(self->sm_aidl);
     G_OBJECT_CLASS(binder_nfc_plugin_parent_class)->finalize(object);
 }
 
