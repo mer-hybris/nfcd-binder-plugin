@@ -47,7 +47,6 @@ systemctl reload-or-try-restart nfcd.service ||:
 systemctl reload-or-try-restart nfcd.service ||:
 
 %files
-%defattr(-,root,root,-)
 %dir %{plugin_dir}
 %{plugin_dir}/*.so
 %if %{license_support} == 0
