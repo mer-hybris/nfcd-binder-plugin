@@ -38,6 +38,7 @@
  */
 
 #include "binder_nfc_adapter.h"
+#include "binder_nfc_api_aidl.h"
 #include "binder_nfc_api_hidl.h"
 #include "binder_nfc_watcher.h"
 #include "plugin.h"
@@ -92,6 +93,11 @@ static const BinderNfcBackend binder_nfc_backends[] = {
         GBINDER_DEFAULT_HWBINDER,
         BINDER_NFC_HIDL_IFACE,
         binder_nfc_api_hidl_new
+    },{
+        "aidl",
+        GBINDER_DEFAULT_BINDER,
+        BINDER_NFC_AIDL_IFACE "/default",
+        binder_nfc_api_aidl_new
     }
 };
 

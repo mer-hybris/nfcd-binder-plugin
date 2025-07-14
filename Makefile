@@ -31,6 +31,7 @@ LIB = $(LIB_SONAME)
 SRC = \
   binder_nfc_adapter.c \
   binder_nfc_api.c \
+  binder_nfc_api_aidl.c \
   binder_nfc_api_hidl.c \
   binder_nfc_plugin.c \
   binder_nfc_watcher.c
