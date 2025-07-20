@@ -37,7 +37,8 @@
  * any official policies, either expressed or implied.
  */
 
-#include "binder_nfc.h"
+#include "binder_nfc_adapter.h"
+#include "binder_nfc_api.h"
 
 #include <nci_adapter_impl.h>
 
@@ -68,16 +69,15 @@ void
 
 struct binder_nfc_adapter {
     NciAdapter adapter;
-    GBinderRemoteObject* remote;
-    GBinderClient* client;
-    GBinderLocalObject* callback;
+    BinderNfcApi* api;
     NciHalIo hal_io;
     NciHalClient* hal_client;
     gulong nci_write_id;
-    char* fqname;
-    gboolean core_initialized;
     gulong death_id;
+    gulong event_id;
+    gulong data_id;
 
+    gboolean core_initialized;
     gboolean need_power;
     gboolean power_on;
     gboolean power_switch_pending;
@@ -86,56 +86,36 @@ struct binder_nfc_adapter {
     BinderNfcAdapterFunc close_cplt;
 };
 
-G_DEFINE_TYPE(BinderNfcAdapter, binder_nfc_adapter, NCI_TYPE_ADAPTER)
-#define BINDER_NFC_TYPE_ADAPTER (binder_nfc_adapter_get_type())
-#define BINDER_NFC_ADAPTER(obj) (G_TYPE_CHECK_INSTANCE_CAST((obj), \
-        BINDER_NFC_TYPE_ADAPTER, BinderNfcAdapter))
-#define SUPER_CLASS binder_nfc_adapter_parent_class
+#define PARENT_CLASS binder_nfc_adapter_parent_class
+#define PARENT_TYPE NCI_TYPE_ADAPTER
+#define THIS_TYPE binder_nfc_adapter_get_type()
+#define THIS(obj) G_TYPE_CHECK_INSTANCE_CAST(obj, THIS_TYPE, BinderNfcAdapter)
+
+GType THIS_TYPE G_GNUC_INTERNAL;
+G_DEFINE_TYPE(BinderNfcAdapter, binder_nfc_adapter, PARENT_TYPE)
 
 enum binder_nfc_adapter_signal {
     SIGNAL_DEATH,
     SIGNAL_COUNT
 };
 
-#define SIGNAL_DEATH_NAME "death"
+#define SIGNAL_DEATH_NAME "binder-nfc-adapter-death"
 
 static guint binder_nfc_adapter_signals[SIGNAL_COUNT] = { 0 };
 
-/* android.hardware.nfc@1.0::INfc */
-#define BINDER_NFC_REQ_OPEN                 (1) /* open */
-#define BINDER_NFC_REQ_WRITE                (2) /* write */
-#define BINDER_NFC_REQ_CORE_INITIALIZED     (3) /* coreInitialized */
-#define BINDER_NFC_REQ_PREDISCOVER          (4) /* prediscover */
-#define BINDER_NFC_REQ_CLOSE                (5) /* close */
-#define BINDER_NFC_REQ_CONTROL_GRANTED      (6) /* controlGranted */
-#define BINDER_NFC_REQ_POWER_CYCLE          (7) /* powerCycle */
+static
+gboolean
+binder_nfc_adapter_close(
+    BinderNfcAdapter* self);
 
-/* android.hardware.nfc@1.0::INfcClientCallback */
-#define BINDER_NFC_REQ_CALLBACK_SEND_EVENT  (1) /* sendEvent */
-#define BINDER_NFC_REQ_SEND_DATA            (2) /* sendData */
+static
+void
+binder_nfc_adapter_state_check(
+    BinderNfcAdapter* self);
 
-#define BINDER_NFC_EVENTS(e) \
-    e(OPEN_CPLT) \
-    e(CLOSE_CPLT) \
-    e(POST_INIT_CPLT) \
-    e(PRE_DISCOVER_CPLT) \
-    e(REQUEST_CONTROL) \
-    e(RELEASE_CONTROL) \
-    e(ERROR)
-
-enum BinderNfcEvent {
-#define HAL_NFC_EVT(x) HAL_NFC_EVT_##x,
-    BINDER_NFC_EVENTS(HAL_NFC_EVT)
-#undef HAL_NFC_EVT
-};
-
-enum BinderNfcStatus_t {
-    HAL_NFC_STATUS_OK,
-    HAL_NFC_STATUS_FAILED,
-    HAL_NFC_STATUS_ERR_TRANSPORT,
-    HAL_NFC_STATUS_ERR_CMD_TIMEOUT,
-    HAL_NFC_STATUS_REFUSED
-};
+/*==========================================================================*
+ *  Trace
+ *==========================================================================*/
 
 #define DIR_IN  '>'
 #define DIR_OUT '<'
@@ -186,204 +166,55 @@ binder_dump_data(
     #define DUMP(f,args...)
 #endif /* !DISABLE_HEXDUMP */
 
-static
-gboolean
-binder_nfc_adapter_close(
-    BinderNfcAdapter* self);
+/*==========================================================================*
+ *  Implementation
+ *==========================================================================*/
 
 static
 void
-binder_nfc_adapter_state_check(
-    BinderNfcAdapter* self);
-
-/*==========================================================================*
- * INfcClientCallback
- *==========================================================================*/
-
-static
-int
-binder_nfc_callback_handle_event(
-    BinderNfcAdapter* self,
-    GBinderReader* reader)
+binder_nfc_adapter_handle_event(
+    BinderNfcApi* api,
+    BINDER_NFC_EVENT event,
+    gpointer user_data)
 {
-    guint32 event, status;
+    BinderNfcAdapter* self = THIS(user_data);
+    BinderNfcAdapterFunc action = NULL;
 
-    if (gbinder_reader_read_uint32(reader, &event) &&
-        gbinder_reader_read_uint32(reader, &status) &&
-        gbinder_reader_at_end(reader)) {
-        BinderNfcAdapterFunc action = NULL;
+    switch (event) {
+    case BINDER_NFC_EVENT_OPEN_CPLT:
+        action = self->open_cplt;
+        self->open_cplt = NULL;
+        break;
+    case BINDER_NFC_EVENT_CLOSE_CPLT:
+        action = self->close_cplt;
+        self->close_cplt = NULL;
+        break;
+    default:
+        break;
+    }
 
-        if (GLOG_ENABLED(GLOG_LEVEL_DEBUG)) {
-            switch (event) {
-#define HAL_NFC_DUMP_EVT(x) case HAL_NFC_EVT_##x: GDEBUG("> " #x); break;
-            BINDER_NFC_EVENTS(HAL_NFC_DUMP_EVT)
-            default:
-                GDEBUG("> event %u", event);
-                break;
-            }
-        }
-        switch (event) {
-        case HAL_NFC_EVT_OPEN_CPLT:
-            action = self->open_cplt;
-            self->open_cplt = NULL;
-            break;
-        case HAL_NFC_EVT_CLOSE_CPLT:
-            action = self->close_cplt;
-            self->close_cplt = NULL;
-            break;
-        default:
-            break;
-        }
-        if (action) {
-            action(self);
-        }
-        return GBINDER_STATUS_OK;
-    } else {
-        GWARN("Failed to parse INfcClientCallback::sendEvent payload");
-        return GBINDER_STATUS_FAILED;
+    if (action) {
+        action(self);
     }
 }
 
 static
-int
-binder_nfc_callback_handle_data(
-    BinderNfcAdapter* self,
-    GBinderReader* reader)
-{
-    gsize len;
-    const guint8* data = gbinder_reader_read_hidl_byte_vec(reader, &len);
-
-    if (data && gbinder_reader_at_end(reader)) {
-        NciHalClient* hal_client = self->hal_client;
-
-        DUMP("%c data, %u byte(s)", DIR_IN, (guint)len);
-        BINDER_DUMP(DIR_IN, data, len);
-        if (hal_client) {
-            hal_client->fn->read(hal_client, data, len);
-        }
-        return GBINDER_STATUS_OK;
-    } else {
-        GWARN("Failed to parse INfcClientCallback::sendData payload");
-        return GBINDER_STATUS_FAILED;
-    }
-}
-
-static
-GBinderLocalReply*
-binder_nfc_callback_handler(
-    GBinderLocalObject* obj,
-    GBinderRemoteRequest* req,
-    guint code,
-    guint flags,
-    int* status,
-    void* user_data)
-{
-    BinderNfcAdapter* self = BINDER_NFC_ADAPTER(user_data);
-    const char* iface = gbinder_remote_request_interface(req);
-
-    if (!g_strcmp0(iface, BINDER_NFC_CALLBACK)) {
-        GBinderReader reader;
-
-        gbinder_remote_request_init_reader(req, &reader);
-        switch (code) {
-        case BINDER_NFC_REQ_CALLBACK_SEND_EVENT:
-            GDEBUG(BINDER_NFC_CALLBACK " %u sendEvent", code);
-            *status = binder_nfc_callback_handle_event(self, &reader);
-            break;
-        case BINDER_NFC_REQ_SEND_DATA:
-            GDEBUG(BINDER_NFC_CALLBACK " %u sendData", code);
-            *status = binder_nfc_callback_handle_data(self, &reader);
-            break;
-        default:
-            GDEBUG(BINDER_NFC_CALLBACK " %u", code);
-            *status = GBINDER_STATUS_FAILED;
-            break;
-        }
-    } else {
-        GDEBUG("%s %u", iface, code);
-        *status = GBINDER_STATUS_FAILED;
-    }
-    return (*status == GBINDER_STATUS_OK) ? gbinder_local_reply_append_int32
-        (gbinder_local_object_new_reply(obj), 0) : NULL;
-}
-
-/*==========================================================================*
- * INfc
- *==========================================================================*/
-
-static
-gulong
-binder_nfc_client_open(
-    BinderNfcAdapter* self,
-    GBinderClientReplyFunc reply)
-{
-    GBinderLocalRequest* req = gbinder_client_new_request(self->client);
-    gulong id;
-
-    GASSERT(self->callback);
-    gbinder_local_request_append_local_object(req, self->callback);
-    id = gbinder_client_transact(self->client, BINDER_NFC_REQ_OPEN,
-        0, req, reply, NULL, self);
-    gbinder_local_request_unref(req);
-    return id;
-}
-
-static
-gulong
-binder_nfc_client_write(
-    BinderNfcAdapter* self,
+void
+binder_nfc_adapter_handle_data(
+    BinderNfcApi* api,
     const void* data,
-    gsize len,
-    GBinderClientReplyFunc complete,
-    GDestroyNotify destroy,
-    void* user_data)
+    gsize size,
+    gpointer user_data)
 {
-    GBinderLocalRequest* req = gbinder_client_new_request(self->client);
-    GBinderWriter writer;
-    gulong id;
+    BinderNfcAdapter* self = THIS(user_data);
+    NciHalClient* hal_client = self->hal_client;
 
-    BINDER_DUMP(DIR_OUT, data, len);
-    gbinder_local_request_init_writer(req, &writer);
-    gbinder_writer_append_hidl_vec(&writer, data, len, 1);
-    id = gbinder_client_transact(self->client, BINDER_NFC_REQ_WRITE,
-        0, req, complete, destroy, user_data);
-    gbinder_local_request_unref(req);
-    return id;
+    DUMP("%c data, %u byte(s)", DIR_IN, (guint) size);
+    BINDER_DUMP(DIR_IN, data, size);
+    if (hal_client) {
+        hal_client->fn->read(hal_client, data, size);
+    }
 }
-
-static
-gulong
-binder_nfc_client_close(
-    BinderNfcAdapter* self,
-    GBinderClientReplyFunc reply)
-{
-    return gbinder_client_transact(self->client, BINDER_NFC_REQ_CLOSE,
-        0, NULL, reply, NULL, self);
-}
-
-static
-gulong
-binder_nfc_client_core_initialized(
-    BinderNfcAdapter* self,
-    GBinderClientReplyFunc reply)
-{
-    return gbinder_client_transact(self->client,
-        BINDER_NFC_REQ_CORE_INITIALIZED, 0, NULL, reply, NULL, self);
-}
-
-static
-gulong
-binder_nfc_client_prediscover(
-    BinderNfcAdapter* self,
-    GBinderClientReplyFunc reply)
-{
-    return gbinder_client_transact(self->client,
-        BINDER_NFC_REQ_PREDISCOVER, 0, NULL, reply, NULL, self);
-}
-
-/*==========================================================================*
- * Implementation
- *==========================================================================*/
 
 static
 void
@@ -451,17 +282,12 @@ binder_nfc_adapter_open_cancel(
 
 static
 void
-binder_nfc_adapter_open_reply(
-    GBinderClient* client,
-    GBinderRemoteReply* reply,
-    int status,
+binder_nfc_adapter_open_complete(
+    BinderNfcApi* api,
+    gboolean success,
     void* user_data)
 {
-    int result = -1;
-    BinderNfcAdapter* self = BINDER_NFC_ADAPTER(user_data);
-    const gboolean success = (status == GBINDER_STATUS_OK &&
-        gbinder_remote_reply_read_int32(reply, &result) &&
-        result == 0);
+    BinderNfcAdapter* self = THIS(user_data);
 
     GASSERT(self->pending_tx);
     self->pending_tx = 0;
@@ -473,7 +299,7 @@ binder_nfc_adapter_open_reply(
                 binder_nfc_adapter_open_done(self);
             }
         } else {
-            GWARN("Power on error %d", result);
+            GWARN("Power on error");
             self->open_cplt = NULL;
             binder_nfc_adapter_set_power(self, FALSE);
         }
@@ -493,17 +319,10 @@ binder_nfc_adapter_open(
     BinderNfcAdapter* self)
 {
     GDEBUG("Opening adapter");
-    if (!self->callback) {
-        GBinderIpc* ipc = gbinder_remote_object_ipc(self->remote);
-        static const char* ifaces[] = { BINDER_NFC_CALLBACK, NULL };
-
-        self->callback = gbinder_local_object_new(ipc, ifaces,
-            binder_nfc_callback_handler, self);
-    }
     self->core_initialized = FALSE;
     self->open_cplt = binder_nfc_adapter_open_cplt;
-    self->pending_tx = binder_nfc_client_open(self,
-        binder_nfc_adapter_open_reply);
+    self->pending_tx = binder_nfc_api_open(self->api,
+        binder_nfc_adapter_open_complete, NULL, self);
     return (self->pending_tx != 0);
 }
 
@@ -521,10 +340,6 @@ void
 binder_nfc_adapter_close_done(
     BinderNfcAdapter* self)
 {
-    /* We can release our local object now */
-    gbinder_local_object_drop(self->callback);
-    self->callback = NULL;
-
     GDEBUG("Power off");
     binder_nfc_adapter_set_power(self, FALSE);
 }
@@ -544,19 +359,13 @@ binder_nfc_adapter_close_cplt(
 
 static
 void
-binder_nfc_adapter_close_reply(
-    GBinderClient* client,
-    GBinderRemoteReply* reply,
-    int status,
+binder_nfc_adapter_close_complete(
+    BinderNfcApi* api,
+    gboolean success,
     void* user_data)
 {
-    int result = 0;
-    BinderNfcAdapter* self = BINDER_NFC_ADAPTER(user_data);
-    const gboolean success = (status == GBINDER_STATUS_OK &&
-        gbinder_remote_reply_read_int32(reply, &result) &&
-        result == 0);
+    BinderNfcAdapter* self = THIS(user_data);
 
-    GVERIFY(gbinder_remote_reply_read_int32(reply, &result));
     GASSERT(self->pending_tx);
     GASSERT(self->power_on);
 
@@ -579,7 +388,7 @@ binder_nfc_adapter_close_reply(
             self->close_cplt = NULL;
             binder_nfc_adapter_close_done(self);
         } else {
-            GWARN("Power on error %d", result);
+            GWARN("Power on error");
             self->close_cplt = NULL;
             binder_nfc_adapter_close_done(self);
         }
@@ -606,8 +415,8 @@ binder_nfc_adapter_close(
     GDEBUG("Closing adapter");
     GASSERT(!self->pending_tx);
     self->close_cplt = binder_nfc_adapter_close_cplt;
-    self->pending_tx = binder_nfc_client_close(self,
-        binder_nfc_adapter_close_reply);
+    self->pending_tx = binder_nfc_api_close(self->api,
+        binder_nfc_adapter_close_complete, NULL, self);
     return (self->pending_tx != 0);
 }
 
@@ -625,26 +434,15 @@ binder_nfc_adapter_power_check(
 
 static
 void
-binder_nfc_adapter_prediscover_reply(
-    GBinderClient* client,
-    GBinderRemoteReply* reply,
-    int status,
+binder_nfc_adapter_prediscover_complete(
+    BinderNfcApi* api,
+    gboolean ok,
     void* user_data)
 {
-    BinderNfcAdapter* self = BINDER_NFC_ADAPTER(user_data);
+    BinderNfcAdapter* self = THIS(user_data);
     NciCore* nci = self->adapter.nci;
 
-#if GUTIL_LOG_DEBUG
-    int result;
-
-    if (status == GBINDER_STATUS_OK &&
-        gbinder_remote_reply_read_int32(reply, &result)) {
-        GDEBUG("PREDISCOVER status %d", result);
-    } else {
-        GDEBUG("PREDISCOVER status failed (that's ok)");
-    }
-#endif /* GUTIL_LOG_DEBUG */
-
+    GDEBUG("PREDISCOVER %s", ok ? "ok" : "failed (that's ok)");
     self->pending_tx = 0;
     nci_core_set_state(nci, NCI_RFST_DISCOVERY);
     binder_nfc_adapter_state_check(self);
@@ -652,25 +450,14 @@ binder_nfc_adapter_prediscover_reply(
 
 static
 void
-binder_nfc_adapter_core_initialized_reply(
-    GBinderClient* client,
-    GBinderRemoteReply* reply,
-    int status,
+binder_nfc_adapter_core_initialized_complete(
+    BinderNfcApi* api,
+    gboolean ok,
     void* user_data)
 {
-    BinderNfcAdapter* self = BINDER_NFC_ADAPTER(user_data);
+    BinderNfcAdapter* self = THIS(user_data);
 
-#if GUTIL_LOG_DEBUG
-    int result;
-
-    if (status == GBINDER_STATUS_OK &&
-        gbinder_remote_reply_read_int32(reply, &result)) {
-        GDEBUG("CORE_INITIALIZED status %d", result);
-    } else {
-        GDEBUG("CORE_INITIALIZED failed (that's ok)");
-    }
-#endif /* GUTIL_LOG_DEBUG */
-
+    GDEBUG("CORE_INITIALIZED %s", ok ? "ok" : "failed (that's ok)");
     self->pending_tx = 0;
     binder_nfc_adapter_state_check(self);
 }
@@ -687,13 +474,13 @@ binder_nfc_adapter_nci_check(
             nci->next_state == NCI_RFST_IDLE) {
             if (!self->core_initialized) {
                 self->core_initialized = TRUE;
-                self->pending_tx = binder_nfc_client_core_initialized(self,
-                    binder_nfc_adapter_core_initialized_reply);
+                self->pending_tx = binder_nfc_api_core_initialized(self->api,
+                    binder_nfc_adapter_core_initialized_complete, NULL, self);
             } else {
                 /* This includes both first time initialization and the case
                  * when NCI state machine has switched to IDLE by itself. */
-                self->pending_tx = binder_nfc_client_prediscover(self,
-                    binder_nfc_adapter_prediscover_reply);
+                self->pending_tx = binder_nfc_api_prediscover(self->api,
+                    binder_nfc_adapter_prediscover_complete, NULL, self);
             }
         }
     }
@@ -708,46 +495,31 @@ binder_nfc_adapter_state_check(
     binder_nfc_adapter_power_check(self);
 }
 
-/*==========================================================================*
- * Interface
- *==========================================================================*/
-
-NfcAdapter*
-binder_nfc_adapter_new(
-    GBinderServiceManager* sm,
-    const char* name)
-{
-    int status = 0;
-    char* fqname = g_strconcat(BINDER_NFC "/", name, NULL);
-    GBinderRemoteObject* remote = gbinder_servicemanager_get_service_sync(sm,
-        fqname, &status);
-
-    if (remote) {
-        BinderNfcAdapter* self = g_object_new(BINDER_NFC_TYPE_ADAPTER, NULL);
-
-        /* gbinder_servicemanager_get_service_sync() returns auto-released
-         * reference, we need to add a reference of our own */
-        self->remote = gbinder_remote_object_ref(remote);
-        self->client = gbinder_client_new(self->remote, BINDER_NFC);
-        self->fqname = fqname;
-        GDEBUG("Connected to %s", fqname);
-        return NFC_ADAPTER(self);
-    } else {
-        GERR("Failed to connect to %s", fqname);
-    }
-
-    g_free(fqname);
-    return NULL;
-}
-
 static
 void
 binder_nfc_adapter_death(
     GBinderRemoteObject* remote,
-    void* adapter)
+    void* self)
 {
-    g_signal_emit(BINDER_NFC_ADAPTER(adapter),
-        binder_nfc_adapter_signals[SIGNAL_DEATH], 0);
+    g_signal_emit(THIS(self), binder_nfc_adapter_signals[SIGNAL_DEATH], 0);
+}
+
+/*==========================================================================*
+ * Internal API
+ *==========================================================================*/
+
+NfcAdapter*
+binder_nfc_adapter_new(
+    BinderNfcApi* api)
+{
+    BinderNfcAdapter* self = g_object_new(THIS_TYPE, NULL);
+
+    g_object_ref(self->api = api);
+    self->event_id = binder_nfc_api_add_event_handler(api,
+        BINDER_NFC_EVENT_ANY, binder_nfc_adapter_handle_event, self);
+    self->data_id = binder_nfc_api_add_data_handler(api,
+        binder_nfc_adapter_handle_data, self);
+    return NFC_ADAPTER(self);
 }
 
 gulong
@@ -757,11 +529,11 @@ binder_nfc_adapter_add_death_handler(
     void* data)
 {
     if (G_LIKELY(adapter) && G_LIKELY(fn)) {
-        BinderNfcAdapter* self = BINDER_NFC_ADAPTER(adapter);
+        BinderNfcAdapter* self = THIS(adapter);
 
         if (!self->death_id) {
             self->death_id = gbinder_remote_object_add_death_handler
-                (self->remote, binder_nfc_adapter_death, self);
+                (self->api->remote, binder_nfc_adapter_death, self);
         }
         return g_signal_connect(self, SIGNAL_DEATH_NAME, G_CALLBACK(fn), data);
     }
@@ -777,8 +549,8 @@ void
 binder_nfc_adapter_current_state_changed(
     NciAdapter* adapter)
 {
-    NCI_ADAPTER_CLASS(SUPER_CLASS)->current_state_changed(adapter);
-    binder_nfc_adapter_state_check(BINDER_NFC_ADAPTER(adapter));
+    NCI_ADAPTER_CLASS(PARENT_CLASS)->current_state_changed(adapter);
+    binder_nfc_adapter_state_check(THIS(adapter));
 }
 
 static
@@ -786,8 +558,8 @@ void
 binder_nfc_adapter_next_state_changed(
     NciAdapter* adapter)
 {
-    NCI_ADAPTER_CLASS(SUPER_CLASS)->next_state_changed(adapter);
-    binder_nfc_adapter_state_check(BINDER_NFC_ADAPTER(adapter));
+    NCI_ADAPTER_CLASS(PARENT_CLASS)->next_state_changed(adapter);
+    binder_nfc_adapter_state_check(THIS(adapter));
 }
 
 static
@@ -796,7 +568,7 @@ binder_nfc_adapter_submit_power_request(
     NfcAdapter* adapter,
     gboolean on)
 {
-    BinderNfcAdapter* self = BINDER_NFC_ADAPTER(adapter);
+    BinderNfcAdapter* self = THIS(adapter);
     NciCore* nci = self->adapter.nci;
 
     self->need_power = on;
@@ -835,7 +607,7 @@ void
 binder_nfc_adapter_cancel_power_request(
     NfcAdapter* adapter)
 {
-    BinderNfcAdapter* self = BINDER_NFC_ADAPTER(adapter);
+    BinderNfcAdapter* self = THIS(adapter);
 
     self->need_power = self->power_on;
     self->power_switch_pending = FALSE;
@@ -868,18 +640,13 @@ binder_nci_adapter_hal_io_write_data_free(
 
 static
 void
-binder_nfc_adapter_hal_io_write_reply(
-    GBinderClient* client,
-    GBinderRemoteReply* reply,
-    int status,
+binder_nfc_adapter_hal_io_write_complete(
+    BinderNfcApi* api,
+    gboolean success,
     void* user_data)
 {
-    gint32 result;
     BinderNciWriteData* write_data = user_data;
     BinderNfcAdapter* self = write_data->self;
-    const gboolean success = (status == GBINDER_STATUS_OK &&
-        gbinder_remote_reply_read_int32(reply, &result) &&
-        result == 0);
 
     self->nci_write_id = 0;
     if (write_data->complete) {
@@ -907,7 +674,7 @@ binder_nfc_adapter_hal_io_stop(
     BinderNfcAdapter* self = binder_nfc_adapter_from_nci_hal_io(hal_io);
 
     if (self->nci_write_id) {
-        gbinder_client_cancel(self->client, self->nci_write_id);
+        gbinder_client_cancel(self->api->client, self->nci_write_id);
         self->nci_write_id = 0;
     }
     self->hal_client = NULL;
@@ -956,8 +723,9 @@ binder_nfc_adapter_hal_io_write(
         write_data->self = self;
         write_data->complete = complete;
 
-        self->nci_write_id = binder_nfc_client_write(self, data, len,
-            binder_nfc_adapter_hal_io_write_reply,
+        BINDER_DUMP(DIR_OUT, data, len);
+        self->nci_write_id = binder_nfc_api_write(self->api, data, len,
+            binder_nfc_adapter_hal_io_write_complete,
             binder_nci_adapter_hal_io_write_data_free, write_data);
     }
 
@@ -973,7 +741,7 @@ binder_nfc_adapter_hal_io_cancel_write(
     BinderNfcAdapter* self = binder_nfc_adapter_from_nci_hal_io(hal_io);
 
     GASSERT(self->nci_write_id);
-    gbinder_client_cancel(self->client, self->nci_write_id);
+    gbinder_client_cancel(self->api->client, self->nci_write_id);
     self->nci_write_id = 0;
 }
 
@@ -1002,16 +770,16 @@ void
 binder_nfc_adapter_finalize(
     GObject* object)
 {
-    BinderNfcAdapter* self = BINDER_NFC_ADAPTER(object);
+    BinderNfcAdapter* self = THIS(object);
+    BinderNfcApi* api = self->api;
 
-    gbinder_client_cancel(self->client, self->nci_write_id);
-    gbinder_client_cancel(self->client, self->pending_tx);
-    gbinder_client_unref(self->client);
-    gbinder_local_object_drop(self->callback);
-    gbinder_remote_object_remove_handler(self->remote, self->death_id);
-    gbinder_remote_object_unref(self->remote);
-    g_free(self->fqname);
-    G_OBJECT_CLASS(SUPER_CLASS)->finalize(object);
+    gbinder_remote_object_remove_handler(api->remote, self->death_id);
+    gbinder_client_cancel(api->client, self->nci_write_id);
+    gbinder_client_cancel(api->client, self->pending_tx);
+    g_signal_handler_disconnect(api, self->event_id);
+    g_signal_handler_disconnect(api, self->data_id);
+    g_object_unref(api);
+    G_OBJECT_CLASS(PARENT_CLASS)->finalize(object);
 }
 
 static

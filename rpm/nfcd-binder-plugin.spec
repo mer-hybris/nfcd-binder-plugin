@@ -7,7 +7,7 @@ License: BSD
 URL: https://github.com/mer-hybris/nfcd-binder-plugin
 Source: %{name}-%{version}.tar.bz2
 
-%define libgbinder_version 1.0.30
+%define libgbinder_version 1.0.40
 %define nfcd_version 1.0.20
 
 BuildRequires: pkgconfig
