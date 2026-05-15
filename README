@@ -1,2 +1,2 @@
 nfcd plugin for Android 8+ based phones. It talks to Android NFC HAL
-interfaces via /dev/hwbinder.
+interfaces via binder. Different binder APIs are supported.
