@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2025 Slava Monich <slava@monich.com>
+ * Copyright (C) 2025-2026 Slava Monich <slava@monich.com>
  *
  * You may use this file under the terms of the BSD license as follows:
  *
@@ -315,16 +315,17 @@ binder_nfc_api_aidl_close(
     GDestroyNotify destroy,
     gpointer user_data)
 {
+    gulong id;
     GBinderLocalRequest* req = gbinder_client_new_request(api->client);
 
     gbinder_local_request_append_int32(req, BINDER_NFC_AIDL_CLOSE_DISABLE);
-
-    /* binder_nfc_api_aidl_call unrefs the request */
-    return gbinder_client_transact(api->client,
-        BINDER_NFC_AIDL_REQ_CLOSE, 0, NULL,
+    id = gbinder_client_transact(api->client,
+        BINDER_NFC_AIDL_REQ_CLOSE, 0, req,
         binder_nfc_api_aidl_close_complete,
         binder_nfc_api_call_destroy,
         binder_nfc_api_call_new(api, complete, destroy, user_data));
+    gbinder_local_request_unref(req);
+    return id;
 }
 
 static
