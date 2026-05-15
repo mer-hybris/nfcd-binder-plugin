@@ -1,8 +1,8 @@
 Name: nfcd-binder-plugin
 
-Version: 1.2.0
+Version: 1.2.1
 Release: 0
-Summary: Binder-based nfcd plugin
+Summary: Binder-based NCI I/O plugin for nfcd
 License: BSD
 URL: https://github.com/mer-hybris/nfcd-binder-plugin
 Source: %{name}-%{version}.tar.bz2
@@ -29,7 +29,7 @@ Requires: nfcd >= %{nfcd_version}
 %define plugin_dir %{_libdir}/nfcd/plugins
 
 %description
-Binder-based NFC plugin for Android 8+.
+Binder-based NCI I/O plugin for nfcd
 
 %prep
 %setup -q
