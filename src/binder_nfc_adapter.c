@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2018-2025 Slava Monich <slava@monich.com>
+ * Copyright (C) 2018-2026 Slava Monich <slava@monich.com>
  * Copyright (C) 2018-2021 Jolla Ltd.
  *
  * You may use this file under the terms of the BSD license as follows:
@@ -388,7 +388,7 @@ binder_nfc_adapter_close_complete(
             self->close_cplt = NULL;
             binder_nfc_adapter_close_done(self);
         } else {
-            GWARN("Power on error");
+            GWARN("Power off error");
             self->close_cplt = NULL;
             binder_nfc_adapter_close_done(self);
         }
