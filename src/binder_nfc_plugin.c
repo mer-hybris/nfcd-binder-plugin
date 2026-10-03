@@ -154,7 +154,7 @@ binder_nfc_plugin_add_adapter(
     BinderNfcApi* api = backend->api(remote);
     BinderNfcPluginEntry* entry = g_new0(BinderNfcPluginEntry, 1);
 
-    entry->adapter = binder_nfc_adapter_new(api);
+    entry->adapter = binder_nfc_adapter_new(api, fqname);
     entry->death_id = binder_nfc_adapter_add_death_handler(entry->adapter,
         binder_nfc_plugin_adapter_death_proc, self);
     g_hash_table_insert(self->adapters, g_strdup(fqname), entry);
@@ -265,6 +265,21 @@ binder_nfc_plugin_stop(
         GHashTableIter it;
         gpointer value;
 
+        /* Close callbacks need a running main context. Disconnect all death
+         * handlers first so nested dispatch cannot invalidate this table. */
+        g_hash_table_iter_init(&it, self->adapters);
+        while (g_hash_table_iter_next(&it, NULL, &value)) {
+            BinderNfcPluginEntry* entry = value;
+
+            nfc_adapter_remove_handler(entry->adapter, entry->death_id);
+            entry->death_id = 0;
+        }
+        g_hash_table_iter_init(&it, self->adapters);
+        while (g_hash_table_iter_next(&it, NULL, &value)) {
+            BinderNfcPluginEntry* entry = value;
+
+            binder_nfc_adapter_shutdown(entry->adapter, 5000);
+        }
         g_hash_table_iter_init(&it, self->adapters);
         while (g_hash_table_iter_next(&it, NULL, &value)) {
             BinderNfcPluginEntry* entry = value;

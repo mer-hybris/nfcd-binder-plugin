@@ -45,7 +45,14 @@
 
 NfcAdapter*
 binder_nfc_adapter_new(
-    BinderNfcApi* api)
+    BinderNfcApi* api,
+    const char* service)
+    G_GNUC_INTERNAL;
+
+gboolean
+binder_nfc_adapter_shutdown(
+    NfcAdapter* adapter,
+    guint timeout_ms)
     G_GNUC_INTERNAL;
 
 gulong
