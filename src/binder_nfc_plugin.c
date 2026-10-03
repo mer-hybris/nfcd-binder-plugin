@@ -154,7 +154,7 @@ binder_nfc_plugin_add_adapter(
     BinderNfcApi* api = backend->api(remote);
     BinderNfcPluginEntry* entry = g_new0(BinderNfcPluginEntry, 1);
 
-    entry->adapter = binder_nfc_adapter_new(api);
+    entry->adapter = binder_nfc_adapter_new(api, fqname);
     entry->death_id = binder_nfc_adapter_add_death_handler(entry->adapter,
         binder_nfc_plugin_adapter_death_proc, self);
     g_hash_table_insert(self->adapters, g_strdup(fqname), entry);

@@ -1,6 +1,6 @@
 # -*- Mode: makefile-gmake -*-
 
-.PHONY: clean all debug release install
+.PHONY: clean all debug release install check
 
 #
 # Required packages
@@ -42,6 +42,7 @@ SRC = \
 
 SRC_DIR = src
 BUILD_DIR = build
+.PHONY: $(BUILD_DIR)/test_close $(BUILD_DIR)/test_guard
 DEBUG_BUILD_DIR = $(BUILD_DIR)/debug
 RELEASE_BUILD_DIR = $(BUILD_DIR)/release
 
@@ -115,6 +116,18 @@ RELEASE_LIB = $(RELEASE_BUILD_DIR)/$(LIB)
 debug: $(DEBUG_LIB)
 
 release: $(RELEASE_LIB)
+
+check: $(BUILD_DIR)/test_close $(BUILD_DIR)/test_guard
+	$(BUILD_DIR)/test_close
+	$(BUILD_DIR)/test_guard
+
+$(BUILD_DIR)/test_close: unit/test_close.c src/binder_nfc_close.h
+	mkdir -p $(BUILD_DIR)
+	$(CC) $(CFLAGS) -std=c99 -Wall -Wextra -Werror -Isrc $< -o $@
+
+$(BUILD_DIR)/test_guard: unit/test_guard.c src/binder_nfc_guard.h
+	mkdir -p $(BUILD_DIR)
+	$(CC) $(CFLAGS) -std=c99 -Wall -Wextra -Werror -Isrc $(shell pkg-config --cflags glib-2.0) $< -o $@ $(shell pkg-config --libs glib-2.0)
 
 clean:
 	rm -f *~ rpm/*~ $(SRC_DIR)/*~

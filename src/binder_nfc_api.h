@@ -54,7 +54,8 @@ struct binder_nfc_api {
 typedef enum binder_nfc_event {
     BINDER_NFC_EVENT_ANY,
     BINDER_NFC_EVENT_OPEN_CPLT,
-    BINDER_NFC_EVENT_CLOSE_CPLT
+    BINDER_NFC_EVENT_CLOSE_CPLT,
+    BINDER_NFC_EVENT_CLOSE_FAILED
 } BINDER_NFC_EVENT;
 
 typedef

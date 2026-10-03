@@ -45,7 +45,8 @@
 
 NfcAdapter*
 binder_nfc_adapter_new(
-    BinderNfcApi* api)
+    BinderNfcApi* api,
+    const char* service)
     G_GNUC_INTERNAL;
 
 gulong

@@ -39,6 +39,8 @@
 
 #include "binder_nfc_adapter.h"
 #include "binder_nfc_api.h"
+#include "binder_nfc_close.h"
+#include "binder_nfc_guard.h"
 
 #include <nci_adapter_impl.h>
 
@@ -83,7 +85,9 @@ struct binder_nfc_adapter {
     gboolean power_switch_pending;
     gulong pending_tx;
     BinderNfcAdapterFunc open_cplt;
-    BinderNfcAdapterFunc close_cplt;
+    BinderNfcClose close;
+    char* guard_path;
+    char* boot_id;
 };
 
 #define PARENT_CLASS binder_nfc_adapter_parent_class
@@ -106,6 +110,11 @@ static guint binder_nfc_adapter_signals[SIGNAL_COUNT] = { 0 };
 static
 gboolean
 binder_nfc_adapter_close(
+    BinderNfcAdapter* self);
+
+static
+void
+binder_nfc_adapter_close_check(
     BinderNfcAdapter* self);
 
 static
@@ -186,8 +195,10 @@ binder_nfc_adapter_handle_event(
         self->open_cplt = NULL;
         break;
     case BINDER_NFC_EVENT_CLOSE_CPLT:
-        action = self->close_cplt;
-        self->close_cplt = NULL;
+    case BINDER_NFC_EVENT_CLOSE_FAILED:
+        binder_nfc_close_event(&self->close,
+            event == BINDER_NFC_EVENT_CLOSE_CPLT);
+        binder_nfc_adapter_close_check(self);
         break;
     default:
         break;
@@ -299,9 +310,12 @@ binder_nfc_adapter_open_complete(
                 binder_nfc_adapter_open_done(self);
             }
         } else {
-            GWARN("Power on error");
+            GWARN("Power on error; NFC session state is unconfirmed");
             self->open_cplt = NULL;
-            binder_nfc_adapter_set_power(self, FALSE);
+            self->close.pending = self->close.failed = true;
+            self->power_on = TRUE;
+            self->power_switch_pending = FALSE;
+            nfc_adapter_power_notify(NFC_ADAPTER(self), TRUE, TRUE);
         }
     } else {
         GDEBUG("Opps, we don't need the power anymore");
@@ -318,6 +332,14 @@ gboolean
 binder_nfc_adapter_open(
     BinderNfcAdapter* self)
 {
+    if (self->close.failed) {
+        GWARN("Cannot reopen an adapter with unconfirmed closure");
+        return FALSE;
+    }
+    if (!binder_nfc_guard_save(self->guard_path, self->boot_id)) {
+        GWARN("Cannot record NFC session; refusing to open adapter");
+        return FALSE;
+    }
     GDEBUG("Opening adapter");
     self->core_initialized = FALSE;
     self->open_cplt = binder_nfc_adapter_open_cplt;
@@ -328,32 +350,21 @@ binder_nfc_adapter_open(
 
 static
 void
-binder_nfc_adapter_reopen_cplt(
+binder_nfc_adapter_close_check(
     BinderNfcAdapter* self)
 {
-    GASSERT(!self->pending_tx);
-    self->pending_tx = binder_nfc_adapter_open(self);
-}
-
-static
-void
-binder_nfc_adapter_close_done(
-    BinderNfcAdapter* self)
-{
-    GDEBUG("Power off");
-    binder_nfc_adapter_set_power(self, FALSE);
-}
-
-static
-void
-binder_nfc_adapter_close_cplt(
-    BinderNfcAdapter* self)
-{
-    if (!self->pending_tx) {
-        /* close call already completed */
-        binder_nfc_adapter_close_done(self);
-    } else {
-        GDEBUG("Waiting for close to complete");
+    if (!self->pending_tx && binder_nfc_close_confirmed(&self->close)) {
+        if (!binder_nfc_guard_clear(self->guard_path)) {
+            self->close.failed = true;
+            GWARN("Cannot clear NFC session guard");
+            return;
+        }
+        self->close.pending = false;
+        GDEBUG("Power off");
+        binder_nfc_adapter_set_power(self, FALSE);
+        if (self->need_power) {
+            self->power_switch_pending = binder_nfc_adapter_open(self);
+        }
     }
 }
 
@@ -367,32 +378,12 @@ binder_nfc_adapter_close_complete(
     BinderNfcAdapter* self = THIS(user_data);
 
     GASSERT(self->pending_tx);
-    GASSERT(self->power_on);
-
     self->pending_tx = 0;
-    if (self->need_power) {
-        /* Reopen the adapter */
-        GDEBUG("Opps, we need the power");
-        if (self->close_cplt) {
-            self->close_cplt = binder_nfc_adapter_reopen_cplt;
-        } else {
-            self->pending_tx = binder_nfc_adapter_open(self);
-        }
-    } else {
-        if (success) {
-            /*
-             * Don't wait for CLOSE_CPLT, it may never come. In those cases
-             * when it does come, it usually comes before completion of the
-             * close() call.
-             */
-            self->close_cplt = NULL;
-            binder_nfc_adapter_close_done(self);
-        } else {
-            GWARN("Power off error");
-            self->close_cplt = NULL;
-            binder_nfc_adapter_close_done(self);
-        }
+    binder_nfc_close_reply(&self->close, success);
+    if (!success) {
+        GWARN("Power off error; retaining powered state");
     }
+    binder_nfc_adapter_close_check(self);
 }
 
 static
@@ -414,9 +405,10 @@ binder_nfc_adapter_close(
 
     GDEBUG("Closing adapter");
     GASSERT(!self->pending_tx);
-    self->close_cplt = binder_nfc_adapter_close_cplt;
+    binder_nfc_close_begin(&self->close);
     self->pending_tx = binder_nfc_api_close(self->api,
         binder_nfc_adapter_close_complete, NULL, self);
+    if (!self->pending_tx) binder_nfc_close_reply(&self->close, false);
     return (self->pending_tx != 0);
 }
 
@@ -425,7 +417,8 @@ void
 binder_nfc_adapter_power_check(
     BinderNfcAdapter* self)
 {
-    if (self->power_on && !self->need_power && !self->pending_tx) {
+    if (self->power_on && !self->need_power && !self->pending_tx &&
+        !self->close.pending) {
         if (binder_nfc_adapter_can_close(self)) {
             binder_nfc_adapter_close(self);
         }
@@ -469,7 +462,8 @@ binder_nfc_adapter_nci_check(
 {
     NciCore* nci = self->adapter.nci;
 
-    if (self->power_on && self->need_power && !self->pending_tx) {
+    if (self->power_on && self->need_power && !self->pending_tx &&
+        !self->close.pending) {
         if (nci->current_state == NCI_RFST_IDLE &&
             nci->next_state == NCI_RFST_IDLE) {
             if (!self->core_initialized) {
@@ -510,10 +504,25 @@ binder_nfc_adapter_death(
 
 NfcAdapter*
 binder_nfc_adapter_new(
-    BinderNfcApi* api)
+    BinderNfcApi* api,
+    const char* service)
 {
     BinderNfcAdapter* self = g_object_new(THIS_TYPE, NULL);
 
+    char* digest = g_compute_checksum_for_string(G_CHECKSUM_SHA256, service, -1);
+
+    self->guard_path = g_strconcat("/var/lib/nfcd/binder-session-", digest, NULL);
+    g_free(digest);
+    if (g_file_get_contents("/proc/sys/kernel/random/boot_id", &self->boot_id,
+        NULL, NULL)) g_strstrip(self->boot_id);
+    if (!binder_nfc_guard_is_clear(self->guard_path, self->boot_id)) {
+        /* The previous process never proved closure. Report busy until a
+         * host reboot; daemon/HAL process death alone isn't that proof. */
+        self->close.pending = self->close.failed = true;
+        self->power_on = TRUE;
+        nfc_adapter_power_notify(NFC_ADAPTER(self), TRUE, FALSE);
+        GWARN("Unconfirmed previous NFC session; host restart required");
+    }
     g_object_ref(self->api = api);
     self->event_id = binder_nfc_api_add_event_handler(api,
         BINDER_NFC_EVENT_ANY, binder_nfc_adapter_handle_event, self);
@@ -572,7 +581,7 @@ binder_nfc_adapter_submit_power_request(
     NciCore* nci = self->adapter.nci;
 
     self->need_power = on;
-    if (self->pending_tx) {
+    if (self->pending_tx || self->close.pending) {
         GDEBUG("Waiting for pending call to complete");
         self->power_switch_pending = TRUE;
     } else if (on) {
@@ -779,6 +788,8 @@ binder_nfc_adapter_finalize(
     g_signal_handler_disconnect(api, self->event_id);
     g_signal_handler_disconnect(api, self->data_id);
     g_object_unref(api);
+    g_free(self->guard_path);
+    g_free(self->boot_id);
     G_OBJECT_CLASS(PARENT_CLASS)->finalize(object);
 }
 

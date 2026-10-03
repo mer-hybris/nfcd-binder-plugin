@@ -153,7 +153,8 @@ binder_nfc_api_aidl_handle_event(
             binder_nfc_api_emit_event(api, BINDER_NFC_EVENT_OPEN_CPLT);
             break;
         case NFC_AIDL_EVT_CLOSE_CPLT:
-            binder_nfc_api_emit_event(api, BINDER_NFC_EVENT_CLOSE_CPLT);
+            binder_nfc_api_emit_event(api, status == 0 ?
+                BINDER_NFC_EVENT_CLOSE_CPLT : BINDER_NFC_EVENT_CLOSE_FAILED);
             break;
         default:
             break;
@@ -196,7 +197,8 @@ binder_nfc_api_aidl_callback_handler(
     BinderNfcApiAidl* self = THIS(user_data);
     const char* iface = gbinder_remote_request_interface(req);
 
-    if (!g_strcmp0(iface, BINDER_NFC_AIDL_CALLBACK_IFACE)) {
+    if (obj == self->callback &&
+        !g_strcmp0(iface, BINDER_NFC_AIDL_CALLBACK_IFACE)) {
         GBinderReader reader;
 
         gbinder_remote_request_init_reader(req, &reader);
@@ -266,11 +268,8 @@ binder_nfc_api_aidl_close_complete(
     void* user_data)
 {
     BinderNfcApiCall* call = user_data;
-    BinderNfcApiAidl* self = THIS(call->api);
-
-    /* We can release our local object now */
-    gbinder_local_object_drop(self->callback);
-    self->callback = NULL;
+    /* CLOSE_CPLT may arrive after this reply. Keep its callback until the
+     * next open, which installs a new callback and rejects the old session. */
     binder_nfc_api_aidl_complete(client, reply, status, call);
 }
 
@@ -289,7 +288,9 @@ binder_nfc_api_aidl_open(
     BinderNfcApiAidl* self = THIS(api);
     GBinderLocalRequest* req = gbinder_client_new_request(api->client);
 
-    if (!self->callback) {
+    gbinder_local_object_drop(self->callback);
+    self->callback = NULL;
+    {
         GBinderIpc* ipc = gbinder_remote_object_ipc(api->remote);
         static const char* ifaces[] = { BINDER_NFC_AIDL_CALLBACK_IFACE, NULL };
 

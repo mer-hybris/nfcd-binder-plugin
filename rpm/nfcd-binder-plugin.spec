@@ -40,6 +40,9 @@ Binder-based NCI I/O plugin for nfcd
 %install
 make DESTDIR=%{buildroot} PLUGIN_DIR=%{plugin_dir} install
 
+%check
+make check
+
 %post
 systemctl reload-or-try-restart nfcd.service ||:
 
