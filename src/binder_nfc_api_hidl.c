@@ -185,7 +185,8 @@ binder_nfc_api_hidl_callback_handler(
     BinderNfcApiHidl* self = THIS(user_data);
     const char* iface = gbinder_remote_request_interface(req);
 
-    if (!g_strcmp0(iface, BINDER_NFC_HIDL_CALLBACK_IFACE)) {
+    if (obj == self->callback &&
+        !g_strcmp0(iface, BINDER_NFC_HIDL_CALLBACK_IFACE)) {
         GBinderReader reader;
 
         gbinder_remote_request_init_reader(req, &reader);
@@ -255,12 +256,20 @@ binder_nfc_api_hidl_close_complete(
     void* user_data)
 {
     BinderNfcApiCall* call = user_data;
-    BinderNfcApiHidl* self = THIS(call->api);
+    GBinderReader reader;
+    gint32 exception = -1, result = -1;
+    gboolean ok;
 
-    /* We can release our local object now */
-    gbinder_local_object_drop(self->callback);
-    self->callback = NULL;
-    binder_nfc_api_hidl_complete(client, reply, status, call);
+    /* HIDL returns Status followed by NfcStatus. A successful transaction
+     * alone does not mean close succeeded. Unlike AIDL, HIDL does not require
+     * a CLOSE_CPLT callback; the successful method result confirms closure. */
+    gbinder_remote_reply_init_reader(reply, &reader);
+    ok = status == GBINDER_STATUS_OK &&
+        gbinder_reader_read_int32(&reader, &exception) && exception == 0 &&
+        gbinder_reader_read_int32(&reader, &result) && result == 0;
+    binder_nfc_api_emit_event(call->api, ok ?
+        BINDER_NFC_EVENT_CLOSE_CPLT : BINDER_NFC_EVENT_CLOSE_FAILED);
+    binder_nfc_api_call_complete(call, ok);
 }
 
 /*==========================================================================*
@@ -278,7 +287,9 @@ binder_nfc_api_hidl_open(
     BinderNfcApiHidl* self = THIS(api);
     GBinderLocalRequest* req = gbinder_client_new_request(api->client);
 
-    if (!self->callback) {
+    gbinder_local_object_drop(self->callback);
+    self->callback = NULL;
+    {
         GBinderIpc* ipc = gbinder_remote_object_ipc(api->remote);
         static const char* ifaces[] = { BINDER_NFC_HIDL_CALLBACK_IFACE, NULL };
 
